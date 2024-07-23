@@ -357,12 +357,15 @@ static int __init alsa_card_aes67_init(void)
 		platform_device_unregister(device);
 		return -ENODEV;
 	}
+	devices[0] = device;
 
 	return 0;
 }
 
 static void __exit alsa_card_aes67_exit(void)
 {
+	snd_printk(KERN_INFO "Attempting to unregister card for AES67\n");
+	platform_device_unregister(devices[0]);
 	snd_printk(KERN_INFO "Attempting to unregistered driver for AES67\n");
 	platform_driver_unregister(&snd_aes67_driver);
 }
