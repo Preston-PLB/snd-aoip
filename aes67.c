@@ -43,6 +43,9 @@ struct aes67 {
 	struct device *dev;
 };
 
+//Forward declarations
+static int snd_aes67_new_pcm(struct aes67 *virtcard);
+
 /* Destructor */
 static int snd_aes67_free(struct aes67 *virtcard)
 {
@@ -83,9 +86,19 @@ static int snd_aes67_create(struct snd_card *card, struct aes67 **rvirtcard)
 	/* Build Sound Device */
 	err = snd_device_new(card, SNDRV_DEV_LOWLEVEL, virtcard, &ops);
 	if (err < 0) {
+		snd_printk(KERN_ERR "Failed to create AES67 device\n");
 		snd_aes67_free(virtcard);
 		return err;
 	}
+
+	/* Add PCM */
+	err = snd_aes67_new_pcm(virtcard);
+	if (err < 0) {
+		snd_printk(KERN_ERR "Failed to create PCM for AES67 device\n");
+		snd_aes67_free(virtcard);
+		return err;
+	}
+
 
 	*rvirtcard = virtcard;
 	return 0;
@@ -285,10 +298,13 @@ static int snd_aes67_new_pcm(struct aes67 *virtcard)
 	struct snd_pcm *pcm;
 	int err;
 
+	snd_printk(KERN_INFO "Initializing PCM for Virtual Soundcard");
 	err = snd_pcm_new(virtcard->card, CARD_NAME, 0, 1, 1, &pcm);
 	if (err < 0)
+		snd_printk(KERN_INFO "Failed initializing PCM for Virtual Soundcard");
 		return err;
 
+	snd_printk(KERN_INFO "Assigning PCM to Virtual Soundcard");
 	pcm->private_data = virtcard;
 	strcpy(pcm->name, CARD_NAME);
 	virtcard->pcm = pcm;
