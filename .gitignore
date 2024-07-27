@@ -5,4 +5,4 @@
 *.order
 *.mod.c
 *.symvers
-.clang-format
+*.cache

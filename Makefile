@@ -1,6 +1,6 @@
 obj-m += aes67.o
 
-CC=ccache gcc
+CC=gcc
 KERN_DIR=/lib/modules/$(shell uname -r)/build/
 
 host:
