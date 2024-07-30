@@ -100,6 +100,7 @@ static int snd_aes67_create(struct snd_card *card, struct aes67 **rvirtcard)
 	}
 
 
+	snd_printk(KERN_INFO "Successfully created AES67\n");
 	*rvirtcard = virtcard;
 	return 0;
 }
@@ -120,6 +121,7 @@ static int aes67_probe(struct platform_device *devptr)
 		return err;
 	}
 	virtcard = card->private_data;
+	virtcard->dev = &devptr->dev; //I don't know if this is safe
 
 	snd_printk(KERN_INFO "Attempting to create AES67 Virtual Soundcard\n");
 	err = snd_aes67_create(card, &virtcard);
@@ -300,20 +302,24 @@ static int snd_aes67_new_pcm(struct aes67 *virtcard)
 
 	snd_printk(KERN_INFO "Initializing PCM for Virtual Soundcard");
 	err = snd_pcm_new(virtcard->card, CARD_NAME, 0, 1, 1, &pcm);
-	if (err < 0)
+	if (err < 0) {
 		snd_printk(KERN_INFO "Failed initializing PCM for Virtual Soundcard");
 		return err;
+	}
 
 	snd_printk(KERN_INFO "Assigning PCM to Virtual Soundcard");
 	pcm->private_data = virtcard;
 	strcpy(pcm->name, CARD_NAME);
 	virtcard->pcm = pcm;
 	/* set operators */
+	snd_printk(KERN_INFO "Settig PCM Playback ops");
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK,
 			&snd_aes67_playback_ops);
+	snd_printk(KERN_INFO "Settig PCM Capture ops");
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &snd_aes67_capture_ops);
 	/*Da buffers*/
-	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, NULL, 64 * 1024,
+	snd_printk(KERN_INFO "Settig PCM managed buffer");
+	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DEV_LOWLEVEL, virtcard->dev, 64 * 1024,
 				       64 * 1024);
 	return 0;
 }
