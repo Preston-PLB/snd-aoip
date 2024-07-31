@@ -6,3 +6,4 @@
 *.mod.c
 *.symvers
 *.cache
+*.o.d

@@ -5,6 +5,8 @@
  *  */
 
 #include <linux/init.h>
+#include <linux/socket.h>
+#include <linux/net.h>
 #include <linux/slab.h>
 #include <linux/platform_device.h>
 #include <sound/pcm.h>
@@ -38,9 +40,14 @@ MODULE_LICENSE("GPL");
 
 /* Definistion of AES67 Virtual SoundCard */
 struct aes67 {
+	/* ALSA Soundcard*/
 	struct snd_card *card;
+	/* PCM Device Soundcard*/
 	struct snd_pcm *pcm;
+	/* Linux Device */
 	struct device *dev;
+	/* Socket */
+	struct socket *socket;
 };
 
 //Forward declarations
@@ -189,7 +196,12 @@ static struct snd_pcm_hardware snd_aes67_capture_hw = {
 static int snd_aes67_playback_open(struct snd_pcm_substream *substream)
 {
 	struct aes67 *virtcard = snd_pcm_substream_chip(substream);
+	struct socket *sock = virtcard->socket;
 	struct snd_pcm_runtime *runtime = substream->runtime;
+
+	int err;
+
+	err = sock_create_kern();
 
 	runtime->hw = snd_aes67_playback_hw;
 	return 0;
