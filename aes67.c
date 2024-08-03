@@ -4,11 +4,14 @@
  *
  *  */
 
+#include <linux/module.h>
 #include <linux/init.h>
 #include <linux/socket.h>
 #include <linux/net.h>
+#include <linux/in.h>
 #include <linux/slab.h>
 #include <linux/platform_device.h>
+#include <net/net_namespace.h>
 #include <sound/pcm.h>
 #include <sound/core.h>
 #include <sound/initval.h>
@@ -22,6 +25,8 @@ static int pcm_substreams[SNDRV_CARDS] = { [0 ...(SNDRV_CARDS - 1)] = 8 };
 static struct platform_device *devices[SNDRV_CARDS];
 
 #define CARD_NAME "AES67 Virtual Soundcard"
+
+#define AES67_NET_SUCCESS 0
 
 module_param_array(index, int, NULL, 0444);
 MODULE_PARM_DESC(index, "Index value for " CARD_NAME " soundcard.");
@@ -48,6 +53,9 @@ struct aes67 {
 	struct device *dev;
 	/* Socket */
 	struct socket *socket;
+
+	/* Receiving Work Queue */
+	struct work_struct receive_work;
 };
 
 //Forward declarations
@@ -56,7 +64,16 @@ static int snd_aes67_new_pcm(struct aes67 *virtcard);
 /* Destructor */
 static int snd_aes67_free(struct aes67 *virtcard)
 {
+	/* free card */
+	snd_printk(KERN_INFO "Freeing Soundcard\n");
 	snd_card_free(virtcard->card);
+
+	/* free socket */
+	if (virtcard->socket) {
+		snd_printk(KERN_INFO "Freeing Socket\n");
+		sock_release(virtcard->socket);
+	}
+
 	kfree(virtcard);
 	return 0;
 }
@@ -98,6 +115,27 @@ static int snd_aes67_create(struct snd_card *card, struct aes67 **rvirtcard)
 		return err;
 	}
 
+	/* create socket */
+	err = sock_create_kern(&init_net, PF_INET, SOCK_DGRAM, IPPROTO_UDP,
+			       &virtcard->socket);
+	if (err < 0) {
+		snd_printk(KERN_ERR
+			   "Failed to create socket for virtual soundcard\n");
+		return err;
+	}
+
+	struct sockaddr_in addr = { .sin_family = AF_INET,
+				    .sin_port = htons(9375),
+				    .sin_addr = { htonl(INADDR_LOOPBACK) } };
+
+	virtcard->socket->ops->bind(virtcard->socket, (struct sockaddr *)&addr,
+				    sizeof(addr));
+	if (err < 0) {
+		snd_printk(KERN_ERR
+			   "Failed to bind socket for virtual soundcard\n");
+		return err;
+	}
+
 	/* Add PCM */
 	err = snd_aes67_new_pcm(virtcard);
 	if (err < 0) {
@@ -105,7 +143,6 @@ static int snd_aes67_create(struct snd_card *card, struct aes67 **rvirtcard)
 		snd_aes67_free(virtcard);
 		return err;
 	}
-
 
 	snd_printk(KERN_INFO "Successfully created AES67\n");
 	*rvirtcard = virtcard;
@@ -157,6 +194,39 @@ error:
 	snd_card_free(card);
 	return err;
 }
+/* Network functions */
+
+static void aes67_rx_net(struct work_struct *work)
+{
+	struct aes67 *virtcard = container_of(work, struct aes67, receive_work);
+	struct kvec iv;
+	struct msghdr msg = {};
+	size_t recv_buf_size = 4096;
+	int ret, buflen;
+	void *recv_buf;
+	/* Read lock socket */
+
+	/* Loop Receive */
+	recv_buf = kzalloc(recv_buf_size, GFP_KERNEL);
+	if (!recv_buf) {
+		snd_printk(KERN_ERR
+			   "Failed to allocate network receive buffer\n");
+		return;
+	}
+
+	do {
+		iv.iov_base = recv_buf;
+		iv.iov_len = recv_buf_size;
+
+		msglen = kernel_recvmsg(virtcard->socket, &msg, &iv, 1, iv.iov_len, MSG_DONTWAIT);
+
+	} while (ret == AES67_NET_SUCCESS);
+
+	/* Handle stream end */
+	snd_printk(KERN_INFO "Finished Receiving work queue\n");
+
+	return;
+}
 
 /* PCM Shenaniagians */
 /* Playback definition */
@@ -196,12 +266,7 @@ static struct snd_pcm_hardware snd_aes67_capture_hw = {
 static int snd_aes67_playback_open(struct snd_pcm_substream *substream)
 {
 	struct aes67 *virtcard = snd_pcm_substream_chip(substream);
-	struct socket *sock = virtcard->socket;
 	struct snd_pcm_runtime *runtime = substream->runtime;
-
-	int err;
-
-	err = sock_create_kern();
 
 	runtime->hw = snd_aes67_playback_hw;
 	return 0;
@@ -255,9 +320,13 @@ static int snd_aes67_pcm_prepare(struct snd_pcm_substream *substream)
 
 static int snd_aes67_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
+	struct aes67 *chip = snd_pcm_substream_chip(substream);
+
+	int err;
+
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		/* do something to start the PCM engine */
+		INIT_WORK(&chip->receive_work, aes67_rx_net);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 		/* do something to stop the PCM engine */
@@ -315,7 +384,8 @@ static int snd_aes67_new_pcm(struct aes67 *virtcard)
 	snd_printk(KERN_INFO "Initializing PCM for Virtual Soundcard");
 	err = snd_pcm_new(virtcard->card, CARD_NAME, 0, 1, 1, &pcm);
 	if (err < 0) {
-		snd_printk(KERN_INFO "Failed initializing PCM for Virtual Soundcard");
+		snd_printk(KERN_INFO
+			   "Failed initializing PCM for Virtual Soundcard");
 		return err;
 	}
 
@@ -331,8 +401,8 @@ static int snd_aes67_new_pcm(struct aes67 *virtcard)
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &snd_aes67_capture_ops);
 	/*Da buffers*/
 	snd_printk(KERN_INFO "Settig PCM managed buffer");
-	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DEV_LOWLEVEL, virtcard->dev, 64 * 1024,
-				       64 * 1024);
+	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DEV_LOWLEVEL, virtcard->dev,
+				       64 * 1024, 64 * 1024);
 	return 0;
 }
 
@@ -404,5 +474,4 @@ static void __exit alsa_card_aes67_exit(void)
 	platform_driver_unregister(&snd_aes67_driver);
 }
 
-module_init(alsa_card_aes67_init)
-module_exit(alsa_card_aes67_exit)
+module_init(alsa_card_aes67_init) module_exit(alsa_card_aes67_exit)
