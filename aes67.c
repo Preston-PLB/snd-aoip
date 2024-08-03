@@ -5,6 +5,7 @@
  *  */
 
 #include <linux/module.h>
+#include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/socket.h>
 #include <linux/net.h>
@@ -21,6 +22,9 @@ static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
 static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
 static int pcm_devs[SNDRV_CARDS] = { [0 ...(SNDRV_CARDS - 1)] = 1 };
 static int pcm_substreams[SNDRV_CARDS] = { [0 ...(SNDRV_CARDS - 1)] = 8 };
+
+/* work for the network streams */
+static struct workqueue_struct *io_workqueue;
 
 static struct platform_device *devices[SNDRV_CARDS];
 
@@ -55,11 +59,18 @@ struct aes67 {
 	struct socket *socket;
 
 	/* Receiving Work Queue */
+	spinlock_t rlock;
 	struct work_struct receive_work;
+	bool rx_on;
 };
 
 //Forward declarations
 static int snd_aes67_new_pcm(struct aes67 *virtcard);
+
+static int work_start(void);
+static void work_stop(void);
+
+static void aes67_rx_net(struct work_struct *rwork);
 
 /* Destructor */
 static int snd_aes67_free(struct aes67 *virtcard)
@@ -136,6 +147,11 @@ static int snd_aes67_create(struct snd_card *card, struct aes67 **rvirtcard)
 		return err;
 	}
 
+	/* Spin lock for receiving */
+	spin_lock_init(&virtcard->rlock);
+	/* Init work for card */
+	INIT_WORK(&virtcard->receive_work, aes67_rx_net);
+
 	/* Add PCM */
 	err = snd_aes67_new_pcm(virtcard);
 	if (err < 0) {
@@ -194,6 +210,27 @@ error:
 	snd_card_free(card);
 	return err;
 }
+/* Work queue Management */
+static void work_stop(void)
+{
+	if (io_workqueue) {
+		destroy_workqueue(io_workqueue);
+		io_workqueue = NULL;
+	}
+}
+
+static int work_start(void)
+{
+	io_workqueue = alloc_workqueue("aes67_io", WQ_HIGHPRI | WQ_MEM_RECLAIM |
+				       WQ_UNBOUND, 0);
+
+	if (!io_workqueue) {
+		snd_printk(KERN_ERR "Failed to start io workqueue struct\n");
+		return -ENOMEM;
+	}
+	return 0;
+}
+
 /* Network functions */
 
 static void aes67_rx_net(struct work_struct *work)
@@ -202,9 +239,8 @@ static void aes67_rx_net(struct work_struct *work)
 	struct kvec iv;
 	struct msghdr msg = {};
 	size_t recv_buf_size = 4096;
-	int ret, buflen;
-	void *recv_buf;
-	/* Read lock socket */
+	ssize_t msglen;
+	unsigned char *recv_buf;
 
 	/* Loop Receive */
 	recv_buf = kzalloc(recv_buf_size, GFP_KERNEL);
@@ -214,14 +250,35 @@ static void aes67_rx_net(struct work_struct *work)
 		return;
 	}
 
-	do {
+	msg.msg_flags = MSG_PEEK | MSG_DONTWAIT;
+
+	snd_printk(KERN_INFO "Starting network receive loop\n");
+	for (;;) {
 		iv.iov_base = recv_buf;
 		iv.iov_len = recv_buf_size;
 
-		msglen = kernel_recvmsg(virtcard->socket, &msg, &iv, 1, iv.iov_len, MSG_DONTWAIT);
+		msglen = kernel_recvmsg(virtcard->socket, &msg, &iv, 1,
+					iv.iov_len, msg.msg_flags);
 
-	} while (ret == AES67_NET_SUCCESS);
+		if (msglen == -EAGAIN) {
+			snd_printk(
+				KERN_WARNING
+				"Failed to receive message. With EAGAIN, Sleeping and trying again\n");
+			msleep(1000);
+			continue;
+		}
 
+		if (msglen < 0) {
+			snd_printk(KERN_ERR "error receiving packet: %zd\n",
+				   msglen);
+			break;
+		}
+
+		if (msglen > 0) {
+			snd_printk(KERN_INFO "Received Buffer: %ph", recv_buf);
+			break;
+		}
+	}
 	/* Handle stream end */
 	snd_printk(KERN_INFO "Finished Receiving work queue\n");
 
@@ -265,8 +322,16 @@ static struct snd_pcm_hardware snd_aes67_capture_hw = {
 
 static int snd_aes67_playback_open(struct snd_pcm_substream *substream)
 {
-	struct aes67 *virtcard = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct aes67 *chip = snd_pcm_substream_chip(substream);
+
+	spin_lock_irq(&chip->rlock);
+	if (!chip->rx_on) {
+		snd_printk(KERN_INFO "Starting receive work queue\n");
+		queue_work(io_workqueue, &chip->receive_work);
+		chip->rx_on = true;
+	}
+	spin_unlock_irq(&chip->rlock);
 
 	runtime->hw = snd_aes67_playback_hw;
 	return 0;
@@ -274,13 +339,11 @@ static int snd_aes67_playback_open(struct snd_pcm_substream *substream)
 
 static int snd_aes67_playback_close(struct snd_pcm_substream *substream)
 {
-	struct aes67 *virtcard = snd_pcm_substream_chip(substream);
 	return 0;
 }
 
 static int snd_aes67_capture_open(struct snd_pcm_substream *substream)
 {
-	struct aes67 *virtcard = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
 
 	runtime->hw = snd_aes67_capture_hw;
@@ -289,7 +352,6 @@ static int snd_aes67_capture_open(struct snd_pcm_substream *substream)
 
 static int snd_aes67_capture_close(struct snd_pcm_substream *substream)
 {
-	struct aes67 *virtcard = snd_pcm_substream_chip(substream);
 	return 0;
 }
 
@@ -309,9 +371,6 @@ static int snd_aes67_pcm_hw_free(struct snd_pcm_substream *substream)
 
 static int snd_aes67_pcm_prepare(struct snd_pcm_substream *substream)
 {
-	struct aes67 *chip = snd_pcm_substream_chip(substream);
-	struct snd_pcm_runtime *runtime = substream->runtime;
-
 	/* set up the hardware with the current configuration
          * for example...
          */
@@ -320,13 +379,8 @@ static int snd_aes67_pcm_prepare(struct snd_pcm_substream *substream)
 
 static int snd_aes67_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
-	struct aes67 *chip = snd_pcm_substream_chip(substream);
-
-	int err;
-
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		INIT_WORK(&chip->receive_work, aes67_rx_net);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 		/* do something to stop the PCM engine */
@@ -402,7 +456,7 @@ static int snd_aes67_new_pcm(struct aes67 *virtcard)
 	/*Da buffers*/
 	snd_printk(KERN_INFO "Settig PCM managed buffer");
 	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DEV_LOWLEVEL, virtcard->dev,
-				       64 * 1024, 64 * 1024);
+				       32 * 1024, 32 * 1024);
 	return 0;
 }
 
@@ -449,6 +503,13 @@ static int __init alsa_card_aes67_init(void)
 		return err;
 	}
 
+	/* Start work queue */
+	err = work_start();
+	if (err < 0) {
+		snd_printk(KERN_ERR "FAILED to start workqueue for AES67\n");
+		return err;
+	}
+
 	//register a card in the kernel
 	struct platform_device *device;
 	device = platform_device_register_simple(SND_AES67_DRIVER, 0, NULL, 0);
@@ -468,6 +529,8 @@ static int __init alsa_card_aes67_init(void)
 
 static void __exit alsa_card_aes67_exit(void)
 {
+	snd_printk(KERN_INFO "Attempting to stop workqueue for AES67\n");
+	work_stop();
 	snd_printk(KERN_INFO "Attempting to unregister card for AES67\n");
 	platform_device_unregister(devices[0]);
 	snd_printk(KERN_INFO "Attempting to unregistered driver for AES67\n");
