@@ -54,7 +54,7 @@ MODULE_LICENSE("GPL");
 struct aes67_stream {
 	bool running;
 	struct socket *socket;
-	spinlock_t rlock;
+	spinlock_t lock;
 	struct work_struct work;
 };
 
@@ -134,18 +134,34 @@ static int snd_aes67_create(struct snd_card *card, struct aes67 **rvirtcard)
 	err = snd_device_new(card, SNDRV_DEV_LOWLEVEL, virtcard, &ops);
 	if (err < 0) {
 		snd_printk(KERN_ERR "Failed to create AES67 device\n");
-		snd_aes67_free(virtcard);
-		return err;
+		goto init_fail;
+	}
+
+	/* Create Streams */
+	err = aes67_stream_create(&virtcard->rx, AES67_STREAM_RX);
+	if (err < 0) {
+		snd_printk(KERN_ERR "Failed to create AES67 RX stream\n");
+		goto init_fail;
+	}
+	err = aes67_stream_create(&virtcard->tx, AES67_STREAM_TX);
+	if (err < 0) {
+		snd_printk(KERN_ERR "Failed to create AES67 TX stream\n");
+		goto init_fail;
 	}
 
 	/* Add PCM */
 	err = snd_aes67_new_pcm(virtcard);
 	if (err < 0) {
 		snd_printk(KERN_ERR "Failed to create PCM for AES67 device\n");
-		snd_aes67_free(virtcard);
-		return err;
+		goto init_fail;
 	}
+	goto success;
 
+init_fail:
+	snd_aes67_free(virtcard);
+	return err;
+
+success:
 	snd_printk(KERN_INFO "Successfully created AES67\n");
 	*rvirtcard = virtcard;
 	return 0;
@@ -221,7 +237,8 @@ static int work_start(void)
 
 static void aes67_rx_net(struct work_struct *work)
 {
-	struct aes67 *virtcard = container_of(work, struct aes67, receive_work);
+	struct aes67_stream *stream =
+		container_of(work, struct aes67_stream, work);
 	struct msghdr msg = {};
 	size_t recv_buf_size = 4096;
 	ssize_t msglen;
@@ -239,11 +256,14 @@ static void aes67_rx_net(struct work_struct *work)
 
 	snd_printk(KERN_INFO "Starting network receive loop\n");
 	for (;;) {
+		if (!stream->running)
+			break;
+
 		struct kvec iv;
 		iv.iov_base = recv_buf;
 		iv.iov_len = recv_buf_size;
 
-		msglen = kernel_recvmsg(virtcard->socket, &msg, &iv, 1,
+		msglen = kernel_recvmsg(stream->socket, &msg, &iv, 1,
 					iv.iov_len, msg.msg_flags);
 
 		if (msglen == -EAGAIN) {
@@ -312,13 +332,23 @@ static int snd_aes67_playback_open(struct snd_pcm_substream *substream)
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct aes67 *chip = snd_pcm_substream_chip(substream);
 
-	spin_lock_irq(&chip->rlock);
-	if (!chip->rx_on) {
-		snd_printk(KERN_INFO "Starting receive work queue\n");
-		queue_work(io_workqueue, &chip->receive_work);
-		chip->rx_on = true;
+	/* Start receive loop */
+	spin_lock(&chip->rx->lock);
+	if (chip->rx && !chip->rx->running) {
+		snd_printk(KERN_INFO "Starting RX work queue\n");
+		queue_work(io_workqueue, &chip->rx->work);
+		chip->rx->running = true;
 	}
-	spin_unlock_irq(&chip->rlock);
+	spin_unlock(&chip->rx->lock);
+
+	/* Start transmit loop */
+	spin_lock(&chip->tx->lock);
+	if (chip->tx && !chip->tx->running) {
+		snd_printk(KERN_INFO "Starting RX work queue\n");
+		queue_work(io_workqueue, &chip->tx->work);
+		chip->tx->running = true;
+	}
+	spin_unlock(&chip->tx->lock);
 
 	runtime->hw = snd_aes67_playback_hw;
 	return 0;
@@ -447,6 +477,16 @@ static int snd_aes67_new_pcm(struct aes67 *virtcard)
 	return 0;
 }
 
+static void aes67_stream_free(struct aes67_stream *stream)
+{
+	stream->running = false;
+	if (stream->socket && stream->socket->ops) {
+		stream->socket->ops->release(stream->socket);
+	}
+
+	kfree(stream);
+}
+
 static int aes67_stream_create(struct aes67_stream **stream, int direction)
 {
 	struct aes67_stream *strm;
@@ -477,7 +517,7 @@ static int aes67_stream_create(struct aes67_stream **stream, int direction)
 	}
 
 	/* Spin lock for receiving */
-	spin_lock_init(&strm->rlock);
+	spin_lock_init(&strm->lock);
 	/* Init work for card */
 	switch (direction) {
 	case AES67_STREAM_RX:
@@ -486,6 +526,9 @@ static int aes67_stream_create(struct aes67_stream **stream, int direction)
 	default:
 		snd_printk(KERN_WARNING "Unimplemented Direction\n");
 	}
+
+	*stream = strm;
+	return 0;
 }
 
 /* Power Methods */
@@ -557,12 +600,12 @@ static int __init alsa_card_aes67_init(void)
 
 static void __exit alsa_card_aes67_exit(void)
 {
-	snd_printk(KERN_INFO "Attempting to stop workqueue for AES67\n");
-	work_stop();
 	snd_printk(KERN_INFO "Attempting to unregister card for AES67\n");
 	platform_device_unregister(devices[0]);
 	snd_printk(KERN_INFO "Attempting to unregistered driver for AES67\n");
 	platform_driver_unregister(&snd_aes67_driver);
+	snd_printk(KERN_INFO "Attempting to stop workqueue for AES67\n");
+	work_stop();
 }
 
 module_init(alsa_card_aes67_init) module_exit(alsa_card_aes67_exit)
