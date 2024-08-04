@@ -32,6 +32,9 @@ static struct platform_device *devices[SNDRV_CARDS];
 
 #define AES67_NET_SUCCESS 0
 
+#define AES67_STREAM_RX 0
+#define AES67_STREAM_TX 1
+
 module_param_array(index, int, NULL, 0444);
 MODULE_PARM_DESC(index, "Index value for " CARD_NAME " soundcard.");
 module_param_array(id, charp, NULL, 0444);
@@ -43,9 +46,17 @@ MODULE_PARM_DESC(pcm_devs, "PCM devices # (0-4) for dummy driver.");
 module_param_array(pcm_substreams, int, NULL, 0444);
 MODULE_PARM_DESC(pcm_substreams, "PCM substreams # (1-128) for dummy driver.");
 
-MODULE_AUTHOR("Preston Baxter <preston@preston-baxter.xom>");
+MODULE_AUTHOR("Preston Baxter <preston@preston-baxter.com>");
 MODULE_DESCRIPTION("AES67 Virtual Soundcard");
 MODULE_LICENSE("GPL");
+
+/* Definition of stream abstraction*/
+struct aes67_stream {
+	bool running;
+	struct socket *socket;
+	spinlock_t rlock;
+	struct work_struct work;
+};
 
 /* Definistion of AES67 Virtual SoundCard */
 struct aes67 {
@@ -56,21 +67,22 @@ struct aes67 {
 	/* Linux Device */
 	struct device *dev;
 	/* Socket */
-	struct socket *socket;
 
-	/* Receiving Work Queue */
-	spinlock_t rlock;
-	struct work_struct receive_work;
-	bool rx_on;
+	/* Streams */
+	struct aes67_stream *rx;
+	struct aes67_stream *tx;
 };
 
-//Forward declarations
+/* Forward declarations */
 static int snd_aes67_new_pcm(struct aes67 *virtcard);
 
 static int work_start(void);
 static void work_stop(void);
 
 static void aes67_rx_net(struct work_struct *rwork);
+
+static void aes67_stream_free(struct aes67_stream *stream);
+static int aes67_stream_create(struct aes67_stream **stream, int direction);
 
 /* Destructor */
 static int snd_aes67_free(struct aes67 *virtcard)
@@ -79,10 +91,15 @@ static int snd_aes67_free(struct aes67 *virtcard)
 	snd_printk(KERN_INFO "Freeing Soundcard\n");
 	snd_card_free(virtcard->card);
 
-	/* free socket */
-	if (virtcard->socket) {
-		snd_printk(KERN_INFO "Freeing Socket\n");
-		sock_release(virtcard->socket);
+	/* free streams */
+	if (virtcard->rx) {
+		snd_printk(KERN_INFO "Freeing RX stream\n");
+		aes67_stream_free(virtcard->rx);
+	}
+
+	if (virtcard->tx) {
+		snd_printk(KERN_INFO "Freeing TX stream\n");
+		aes67_stream_free(virtcard->tx);
 	}
 
 	kfree(virtcard);
@@ -106,17 +123,12 @@ static int snd_aes67_create(struct snd_card *card, struct aes67 **rvirtcard)
 	};
 
 	*rvirtcard = NULL;
-
-	/* Setup Connection Handlers */
-
 	/* allocate memory for virt card */
 	virtcard = kzalloc(sizeof(*virtcard), GFP_KERNEL);
 	if (virtcard == NULL)
 		return -ENOMEM;
 
 	virtcard->card = card;
-
-	/* COnnect to things */
 
 	/* Build Sound Device */
 	err = snd_device_new(card, SNDRV_DEV_LOWLEVEL, virtcard, &ops);
@@ -125,32 +137,6 @@ static int snd_aes67_create(struct snd_card *card, struct aes67 **rvirtcard)
 		snd_aes67_free(virtcard);
 		return err;
 	}
-
-	/* create socket */
-	err = sock_create_kern(&init_net, PF_INET, SOCK_DGRAM, IPPROTO_UDP,
-			       &virtcard->socket);
-	if (err < 0) {
-		snd_printk(KERN_ERR
-			   "Failed to create socket for virtual soundcard\n");
-		return err;
-	}
-
-	struct sockaddr_in addr = { .sin_family = AF_INET,
-				    .sin_port = htons(9375),
-				    .sin_addr = { htonl(INADDR_LOOPBACK) } };
-
-	virtcard->socket->ops->bind(virtcard->socket, (struct sockaddr *)&addr,
-				    sizeof(addr));
-	if (err < 0) {
-		snd_printk(KERN_ERR
-			   "Failed to bind socket for virtual soundcard\n");
-		return err;
-	}
-
-	/* Spin lock for receiving */
-	spin_lock_init(&virtcard->rlock);
-	/* Init work for card */
-	INIT_WORK(&virtcard->receive_work, aes67_rx_net);
 
 	/* Add PCM */
 	err = snd_aes67_new_pcm(virtcard);
@@ -221,8 +207,8 @@ static void work_stop(void)
 
 static int work_start(void)
 {
-	io_workqueue = alloc_workqueue("aes67_io", WQ_HIGHPRI | WQ_MEM_RECLAIM |
-				       WQ_UNBOUND, 0);
+	io_workqueue = alloc_workqueue(
+		"aes67_io", WQ_HIGHPRI | WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
 
 	if (!io_workqueue) {
 		snd_printk(KERN_ERR "Failed to start io workqueue struct\n");
@@ -236,7 +222,6 @@ static int work_start(void)
 static void aes67_rx_net(struct work_struct *work)
 {
 	struct aes67 *virtcard = container_of(work, struct aes67, receive_work);
-	struct kvec iv;
 	struct msghdr msg = {};
 	size_t recv_buf_size = 4096;
 	ssize_t msglen;
@@ -250,10 +235,11 @@ static void aes67_rx_net(struct work_struct *work)
 		return;
 	}
 
-	msg.msg_flags = MSG_PEEK | MSG_DONTWAIT;
+	msg.msg_flags = MSG_WAITFORONE;
 
 	snd_printk(KERN_INFO "Starting network receive loop\n");
 	for (;;) {
+		struct kvec iv;
 		iv.iov_base = recv_buf;
 		iv.iov_len = recv_buf_size;
 
@@ -275,12 +261,13 @@ static void aes67_rx_net(struct work_struct *work)
 		}
 
 		if (msglen > 0) {
-			snd_printk(KERN_INFO "Received Buffer: %ph", recv_buf);
-			break;
+			snd_printk(KERN_INFO "Received Buffer: %s\n", recv_buf);
+			continue;
 		}
 	}
 	/* Handle stream end */
 	snd_printk(KERN_INFO "Finished Receiving work queue\n");
+	kfree(recv_buf);
 
 	return;
 }
@@ -458,6 +445,47 @@ static int snd_aes67_new_pcm(struct aes67 *virtcard)
 	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DEV_LOWLEVEL, virtcard->dev,
 				       32 * 1024, 32 * 1024);
 	return 0;
+}
+
+static int aes67_stream_create(struct aes67_stream **stream, int direction)
+{
+	struct aes67_stream *strm;
+	int err;
+
+	strm = kzalloc(sizeof(*strm), GFP_KERNEL);
+	if (!strm)
+		return -ENOMEM;
+
+	/* create socket */
+	err = sock_create_kern(&init_net, PF_INET, SOCK_DGRAM, IPPROTO_UDP,
+			       &strm->socket);
+	if (err < 0) {
+		snd_printk(KERN_ERR "Failed to create socket for stream\n");
+		return err;
+	}
+
+	struct sockaddr_in addr = { .sin_family = AF_INET,
+				    .sin_port = htons(9375),
+				    .sin_addr = { htonl(INADDR_LOOPBACK) } };
+
+	strm->socket->ops->bind(strm->socket, (struct sockaddr *)&addr,
+				sizeof(addr));
+	if (err < 0) {
+		snd_printk(KERN_ERR
+			   "Failed to bind socket for virtual soundcard\n");
+		return err;
+	}
+
+	/* Spin lock for receiving */
+	spin_lock_init(&strm->rlock);
+	/* Init work for card */
+	switch (direction) {
+	case AES67_STREAM_RX:
+		INIT_WORK(&strm->work, aes67_rx_net);
+		break;
+	default:
+		snd_printk(KERN_WARNING "Unimplemented Direction\n");
+	}
 }
 
 /* Power Methods */
