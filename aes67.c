@@ -252,12 +252,10 @@ static void aes67_rx_net(struct work_struct *work)
 		return;
 	}
 
-	msg.msg_flags = MSG_WAITFORONE;
+	msg.msg_flags = MSG_DONTWAIT;
 
 	snd_printk(KERN_INFO "Starting network receive loop\n");
-	for (;;) {
-		if (!stream->running)
-			break;
+	while (stream->running) {
 
 		struct kvec iv;
 		iv.iov_base = recv_buf;
@@ -267,10 +265,7 @@ static void aes67_rx_net(struct work_struct *work)
 					iv.iov_len, msg.msg_flags);
 
 		if (msglen == -EAGAIN) {
-			snd_printk(
-				KERN_WARNING
-				"Failed to receive message. With EAGAIN, Sleeping and trying again\n");
-			msleep(1000);
+			msleep(10);
 			continue;
 		}
 
@@ -506,7 +501,7 @@ static int aes67_stream_create(struct aes67_stream **stream, int direction)
 
 	struct sockaddr_in addr = { .sin_family = AF_INET,
 				    .sin_port = htons(9375),
-				    .sin_addr = { htonl(INADDR_LOOPBACK) } };
+				    .sin_addr = { htonl(INADDR_ANY) } };
 
 	strm->socket->ops->bind(strm->socket, (struct sockaddr *)&addr,
 				sizeof(addr));
