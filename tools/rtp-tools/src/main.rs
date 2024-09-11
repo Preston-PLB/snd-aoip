@@ -1,9 +1,4 @@
-use std::{
-    fs::File,
-    io::Read,
-    vec::Vec,
-    cmp::min
-};
+use std::{cmp::min, fs::File, io::Read, vec::Vec};
 
 use anyhow::Result;
 
@@ -33,19 +28,25 @@ const MTU: usize = 1500;
 fn main() -> Result<()> {
     let cli = Args::parse();
 
+    let local_addr = match cli.bind {
+        Some(s) => s,
+        None => "0.0.0.0:6767".to_string(),
+    };
+
+    let pacing = std::time::Duration::new(0, 10000);
+
     match &cli.command {
         Some(Commands::Play { file, addr }) => {
             println!("Playing {file:?} -> {addr}");
             //open file
             let mut fd = File::open(file)?;
 
-            //buffer
-            let mut file_buffer = Vec::with_capacity(1500 * 512);
-            let read_bytes = fd.read_to_end(&mut file_buffer)?;
+            //read file into memory
+            let mut file_buffer = Vec::with_capacity(1500 * 4096); //16 packets
+            let buffer_len = fd.read_to_end(&mut file_buffer)?;
 
-            let buffer_len = file_buffer.len();
-            println!("ReadBytes {read_bytes} Len {buffer_len}");
-
+            //Construct the size of data allowed
+            //TODO: Support variable MTU. Also calculate RTP packet size
             let header_len = MTU - 8 - 176;
             let mut packet_len = buffer_len / header_len;
             if buffer_len % header_len > 0 {
@@ -65,13 +66,19 @@ fn main() -> Result<()> {
                 }
             }
 
+            //open socket
+            let udp_socket = std::net::UdpSocket::bind(local_addr)?;
+            udp_socket.connect(addr)?;
+
+            let mut i = 0;
             for packet in packets {
-                let s = String::from_utf8(packet)?;
-                println!("Packet: {s}");
+                std::thread::sleep(pacing);
+                print!("Playing chunk {i} of {packet_len}\r");
+                udp_socket.send(&packet)?;
+                i += 1;
             }
 
-            //open socket
-
+            println!("Finished playing all the things.");
             //stream file to socket
             Ok(())
         }
