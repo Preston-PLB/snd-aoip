@@ -1,4 +1,4 @@
-use std::{cmp::min, fs::File, io::Read, vec::Vec};
+use std::{cmp::min, fs::File, io::Read, vec::Vec, time::Duration};
 
 use anyhow::Result;
 
@@ -25,6 +25,15 @@ enum Commands {
 
 const MTU: usize = 1500;
 
+fn pacing(sample_rate: u32, bitdepth: usize, size: usize) -> Duration {
+    let samples = size / bitdepth;
+    let seconds = samples as f32 / sample_rate as f32;
+    let just_seconds = seconds.floor();
+    let nanos = (seconds - just_seconds) * 1e9;
+
+    Duration::new(just_seconds as u64, nanos as u32)
+}
+
 fn main() -> Result<()> {
     let cli = Args::parse();
 
@@ -32,8 +41,6 @@ fn main() -> Result<()> {
         Some(s) => s,
         None => "0.0.0.0:6767".to_string(),
     };
-
-    let pacing = std::time::Duration::new(0, 10000);
 
     match &cli.command {
         Some(Commands::Play { file, addr }) => {
@@ -70,7 +77,8 @@ fn main() -> Result<()> {
             let udp_socket = std::net::UdpSocket::bind(local_addr)?;
             udp_socket.connect(addr)?;
 
-            let mut i = 0;
+            let pacing = pacing(48000, 16, header_len);
+            let mut i = 1;
             for packet in packets {
                 std::thread::sleep(pacing);
                 print!("Playing chunk {i} of {packet_len}\r");
@@ -78,7 +86,7 @@ fn main() -> Result<()> {
                 i += 1;
             }
 
-            println!("Finished playing all the things.");
+            println!("\nFinished playing all the things.");
             //stream file to socket
             Ok(())
         }
