@@ -3,6 +3,7 @@ use std::{cmp::min, fs::File, io::Read, vec::Vec, time::Duration};
 use anyhow::Result;
 
 use clap::{Parser, Subcommand};
+use rtp_rs::*;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -80,10 +81,18 @@ fn main() -> Result<()> {
             let pacing = pacing(48000, 16, header_len);
             let mut i = 1;
             for packet in packets {
-                std::thread::sleep(pacing);
                 print!("Playing chunk {i} of {packet_len}\r");
-                udp_socket.send(&packet)?;
+                let p = RtpPacketBuilder::new()
+                    .payload_type(111)
+                    .ssrc(1337)
+                    .sequence(Seq::from(i))
+                    .timestamp(10000+i as u32)
+                    .marked(true)
+                    .payload(&packet)
+                    .build();
+                udp_socket.send(&p)?;
                 i += 1;
+                std::thread::sleep(pacing);
             }
 
             println!("\nFinished playing all the things.");
