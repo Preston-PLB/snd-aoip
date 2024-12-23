@@ -4,18 +4,7 @@
  *
  *  */
 
-#include <linux/module.h>
-#include <linux/delay.h>
-#include <linux/init.h>
-#include <linux/socket.h>
-#include <linux/net.h>
-#include <linux/in.h>
-#include <linux/slab.h>
-#include <linux/platform_device.h>
-#include <net/net_namespace.h>
-#include <sound/pcm.h>
-#include <sound/core.h>
-#include <sound/initval.h>
+#include <snoip.h>
 
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
@@ -34,7 +23,6 @@ static struct platform_device *devices[SNDRV_CARDS];
 
 #define AES67_STREAM_RX 0
 #define AES67_STREAM_TX 1
-
 module_param_array(index, int, NULL, 0444);
 MODULE_PARM_DESC(index, "Index value for " CARD_NAME " soundcard.");
 module_param_array(id, charp, NULL, 0444);
@@ -276,6 +264,9 @@ static void aes67_rx_net(struct work_struct *work)
 		}
 
 		if (msglen > 0) {
+			//Parsse packet
+
+			//add packet to ring queue
 			snd_printk(KERN_INFO "Received Buffer: %s\n", recv_buf);
 			continue;
 		}

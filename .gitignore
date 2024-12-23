@@ -7,3 +7,4 @@
 *.symvers
 *.cache
 *.o.d
+scripts/gen_compile_commands.py
