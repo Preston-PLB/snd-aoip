@@ -353,7 +353,9 @@ static int snd_aes67_capture_open(struct snd_pcm_substream *substream)
 	}
 	spin_unlock(&chip->rx->lock);
 
-	runtime->hw = snd_aes67_playback_hw;
+
+
+	runtime->hw = snd_aes67_capture_hw;
 	return 0;
 }
 
