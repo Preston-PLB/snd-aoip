@@ -34,15 +34,15 @@ struct snoip_rtp_stream {
 };
 
 //allocate new rtp stream
-static int snoip_rtp_stream_create(struct snoip_rtp_stream **stream, size_t size);
+int snoip_rtp_stream_create(struct snoip_rtp_stream **stream, size_t size);
 //free rtp stream
-static void snoip_rtp_steam_free(struct snoip_rtp_stream *stream);
+void snoip_rtp_steam_free(struct snoip_rtp_stream *stream);
 
 //write rtp packet to stream
-static int snoip_rtp_stream_write(struct snoip_rtp_stream *stream,
+int snoip_rtp_stream_write(struct snoip_rtp_stream *stream,
 				  unsigned char *packet_buf);
 //copy rtp stream buffer to dma region
-static int snoip_rtp_stream_copy_dma(struct snoip_rtp_stream *stream,
-				     struct snd_pcm_runtime *runtime);
+int snoip_rtp_stream_copy_dma(struct snoip_rtp_stream *stream,
+				     struct snd_pcm_runtime *runtime, uint32_t bytes);
 
 #endif

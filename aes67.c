@@ -41,8 +41,9 @@ MODULE_LICENSE("GPL");
 /* Definition of stream abstraction*/
 struct aes67_stream {
 	bool running;
-	struct socket *socket;
 	spinlock_t lock;
+	struct snoip_rtp_stream *rtp_stream;
+	struct socket *socket;
 	struct work_struct work;
 };
 
@@ -228,6 +229,7 @@ static void aes67_rx_net(struct work_struct *work)
 	struct aes67_stream *stream =
 		container_of(work, struct aes67_stream, work);
 	struct msghdr msg = {};
+	int err;
 	size_t recv_buf_size = 4096;
 	ssize_t msglen;
 	unsigned char *recv_buf;
@@ -244,7 +246,6 @@ static void aes67_rx_net(struct work_struct *work)
 
 	snd_printk(KERN_INFO "Starting network receive loop\n");
 	while (stream->running) {
-
 		struct kvec iv;
 		iv.iov_base = recv_buf;
 		iv.iov_len = recv_buf_size;
@@ -264,10 +265,13 @@ static void aes67_rx_net(struct work_struct *work)
 		}
 
 		if (msglen > 0) {
-			//Parsse packet
+			err = snoip_rtp_stream_write(stream->rtp_stream,
+						     recv_buf);
+			if (err < 0)
+				snd_printk(KERN_ERR
+					   "Failed to write to rtp stream %d\n",
+					   err);
 
-			//add packet to ring queue
-			snd_printk(KERN_INFO "Received Buffer: %s\n", recv_buf);
 			continue;
 		}
 	}
@@ -470,6 +474,10 @@ static void aes67_stream_free(struct aes67_stream *stream)
 		stream->socket->ops->release(stream->socket);
 	}
 
+	if (stream->rtp_stream) {
+		snoip_rtp_steam_free(stream->rtp_stream);
+	}
+
 	kfree(stream);
 }
 
@@ -499,6 +507,14 @@ static int aes67_stream_create(struct aes67_stream **stream, int direction)
 	if (err < 0) {
 		snd_printk(KERN_ERR
 			   "Failed to bind socket for virtual soundcard\n");
+		return err;
+	}
+
+	/* init rtp stream*/
+	struct snoip_rtp_stream *rtp_stream;
+	err = snoip_rtp_stream_create(&rtp_stream, 200);
+	if (err < 0) {
+		snd_printk(KERN_ERR "Failed to allocate snoip rtp stream\n");
 		return err;
 	}
 

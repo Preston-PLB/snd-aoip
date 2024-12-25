@@ -1,9 +1,8 @@
 obj-m := snoip.o
 snoip-y := aes67.o rtp.o
 
-ccflags-y := -I $(src)/include
+ccflags-y := -I $(src)/inc
 
-CC=gcc
 KERN_DIR=/lib/modules/$(shell uname -r)/build/
 
 default:

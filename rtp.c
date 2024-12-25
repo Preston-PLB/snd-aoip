@@ -1,7 +1,6 @@
 #include <snoip.h>
 
-static int snoip_rtp_stream_create(struct snoip_rtp_stream **stream,
-				   size_t size)
+int snoip_rtp_stream_create(struct snoip_rtp_stream **stream, size_t size)
 {
 	struct snoip_rtp_stream *strm;
 
@@ -28,11 +27,13 @@ static int snoip_rtp_stream_create(struct snoip_rtp_stream **stream,
 	if (strm->data == NULL)
 		return -ENOMEM;
 
+	strm->empty = true;
+
 	*stream = strm;
 	return 0;
 }
 
-static void snoip_rtp_steam_free(struct snoip_rtp_stream *stream)
+void snoip_rtp_steam_free(struct snoip_rtp_stream *stream)
 {
 	if (stream->data)
 		kfree(stream->data);
@@ -47,8 +48,8 @@ static void snoip_rtp_steam_free(struct snoip_rtp_stream *stream)
 		kfree(stream->packet_info);
 }
 
-static int snoip_rtp_stream_write(struct snoip_rtp_stream *stream,
-				  unsigned char *packet_buf)
+int snoip_rtp_stream_write(struct snoip_rtp_stream *stream,
+			   unsigned char *packet_buf)
 {
 	if (packet_buf == NULL)
 		return EINVAL;
@@ -81,10 +82,39 @@ static int snoip_rtp_stream_write(struct snoip_rtp_stream *stream,
 
 	memcpy(stream->data + start_idx, packet_buf + 16, RTP_PAYLOAD_SIZE);
 
-	//The idea is the writer will always be at the furtherest written packet.
-	stream->writer = (stream->writer == 0 || stream->writer < start_idx) ?
-				 start_idx :
-				 stream->writer;
+	return 0;
+}
+
+int snoip_rtp_stream_copy_dma(struct snoip_rtp_stream *stream,
+			      struct snd_pcm_runtime *runtime, uint32_t bytes)
+{
+	char *dst = runtime->dma_area;
+	char *src = stream->data;
+
+	unsigned int stream_bytes = stream->size * RTP_PAYLOAD_SIZE;
+	uint32_t b = bytes;
+
+	unsigned int src_offset = stream->reader * RTP_PAYLOAD_SIZE;
+	unsigned int dst_offset = stream->writer;
+
+	for (;;) {
+		uint32_t size = bytes;
+		if (size + dst_offset > runtime->dma_bytes)
+			size = runtime->dma_bytes - dst_offset;
+		if (size + src_offset > stream->size * RTP_PAYLOAD_SIZE)
+			size = runtime->dma_bytes - src_offset;
+		else
+			memcpy(dst + dst_offset, src + src_offset, size);
+
+		bytes -= size;
+		if (bytes == 0)
+			break;
+		src_offset = (src_offset + size) % stream_bytes;
+		dst_offset = (dst_offset + size) % runtime->dma_bytes;
+	}
+
+	stream->reader = (src_offset + b) % stream_bytes;
+	stream->writer = (dst_offset + b) % runtime->dma_bytes;
 
 	return 0;
 }

@@ -12,4 +12,4 @@ fi
 SCRIPT="s/\.\//$(echo $KERN_DIR | sed -E 's/\//\\\//g')/g"
 echo $SCRIPT
 
-sed -iE $SCRIPT compile_commands.json
+sed -Ei $SCRIPT compile_commands.json
