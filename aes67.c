@@ -318,21 +318,11 @@ static int snd_aes67_playback_open(struct snd_pcm_substream *substream)
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct aes67 *chip = snd_pcm_substream_chip(substream);
 
-	/* Start receive loop */
-	spin_lock(&chip->rx->lock);
-	if (chip->rx && !chip->rx->running) {
-		snd_printk(KERN_INFO "Starting RX work queue\n");
-		queue_work(io_workqueue, &chip->rx->work);
-		chip->rx->running = true;
-	}
-	spin_unlock(&chip->rx->lock);
-
 	/* Start transmit loop */
 	spin_lock(&chip->tx->lock);
 	if (chip->tx && !chip->tx->running) {
-		snd_printk(KERN_INFO "Starting RX work queue\n");
+		snd_printk(KERN_INFO "Starting TX work queue\n");
 		queue_work(io_workqueue, &chip->tx->work);
-		chip->tx->running = true;
 	}
 	spin_unlock(&chip->tx->lock);
 
@@ -348,8 +338,18 @@ static int snd_aes67_playback_close(struct snd_pcm_substream *substream)
 static int snd_aes67_capture_open(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct aes67 *chip = snd_pcm_substream_chip(substream);
 
-	runtime->hw = snd_aes67_capture_hw;
+	/* Start receive loop */
+	spin_lock(&chip->rx->lock);
+	if (chip->rx && !chip->rx->running) {
+		snd_printk(KERN_INFO "Starting RX work queue\n");
+		chip->rx->running = true;
+		queue_work(io_workqueue, &chip->rx->work);
+	}
+	spin_unlock(&chip->rx->lock);
+
+	runtime->hw = snd_aes67_playback_hw;
 	return 0;
 }
 
@@ -451,13 +451,13 @@ static int snd_aes67_new_pcm(struct aes67 *virtcard)
 	strcpy(pcm->name, CARD_NAME);
 	virtcard->pcm = pcm;
 	/* set operators */
-	snd_printk(KERN_INFO "Settig PCM Playback ops");
+	snd_printk(KERN_INFO "Setting PCM Playback ops");
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK,
 			&snd_aes67_playback_ops);
-	snd_printk(KERN_INFO "Settig PCM Capture ops");
+	snd_printk(KERN_INFO "Setting PCM Capture ops");
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &snd_aes67_capture_ops);
 	/*Da buffers*/
-	snd_printk(KERN_INFO "Settig PCM managed buffer");
+	snd_printk(KERN_INFO "Setting PCM managed buffer");
 	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DEV_LOWLEVEL, virtcard->dev,
 				       32 * 1024, 32 * 1024);
 	return 0;

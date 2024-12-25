@@ -14,4 +14,35 @@
 #include <sound/core.h>
 #include <sound/initval.h>
 
+/*
+ * RTP stream
+ *
+ */
+
+#define RTP_PAYLOAD_SIZE 1446
+
+struct snoip_rtp_stream {
+	bool empty;
+	uint32_t sync_source;
+	uint32_t size;
+	uint32_t reader;
+	uint32_t writer;
+	uint32_t *packet_info;
+	uint32_t *timestamp;
+	uint32_t *csrc;
+	uint8_t *data;
+};
+
+//allocate new rtp stream
+static int snoip_rtp_stream_create(struct snoip_rtp_stream **stream, size_t size);
+//free rtp stream
+static void snoip_rtp_steam_free(struct snoip_rtp_stream *stream);
+
+//write rtp packet to stream
+static int snoip_rtp_stream_write(struct snoip_rtp_stream *stream,
+				  unsigned char *packet_buf);
+//copy rtp stream buffer to dma region
+static int snoip_rtp_stream_copy_dma(struct snoip_rtp_stream *stream,
+				     struct snd_pcm_runtime *runtime);
+
 #endif
