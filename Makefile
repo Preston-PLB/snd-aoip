@@ -9,7 +9,7 @@ default:
 	$(MAKE) -C $(KERN_DIR) M=$$PWD modules
 autoclean: clean default setup
 setup:
-	./scripts/gen_compile_commands.sh $(KERN_DIR)
+	 bear -- $(MAKE)
 clean:
 	$(MAKE) -C $(KERN_DIR) M=$(PWD) clean
 help:
