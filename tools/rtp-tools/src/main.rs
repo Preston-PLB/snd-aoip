@@ -89,8 +89,8 @@ fn main() -> Result<()> {
                     .timestamp(10000+i as u32)
                     .marked(true)
                     .payload(&packet)
-                    .build();
-                udp_socket.send(&p)?;
+                    .build().unwrap(); //probably unsafe but its testing
+                udp_socket.send(p.as_slice())?;
                 i += 1;
                 std::thread::sleep(pacing);
             }

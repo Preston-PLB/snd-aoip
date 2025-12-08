@@ -266,7 +266,7 @@ static void aes67_rx_net(struct work_struct *work)
 
 		if (msglen > 0) {
 			err = snoip_rtp_stream_write(stream->rtp_stream,
-						     recv_buf);
+						     recv_buf, msglen);
 			if (err < 0)
 				printk(KERN_ERR
 					   "Failed to write to rtp stream %d\n",
@@ -517,6 +517,7 @@ static int aes67_stream_create(struct aes67_stream **stream, int direction)
 		printk(KERN_ERR "Failed to allocate snoip rtp stream\n");
 		return err;
 	}
+    strm->rtp_stream = rtp_stream;
 
 	/* Spin lock for receiving */
 	spin_lock_init(&strm->lock);

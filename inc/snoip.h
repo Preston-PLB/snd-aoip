@@ -40,7 +40,7 @@ void snoip_rtp_steam_free(struct snoip_rtp_stream *stream);
 
 //write rtp packet to stream
 int snoip_rtp_stream_write(struct snoip_rtp_stream *stream,
-				  unsigned char *packet_buf);
+				  const uint8_t *packet_buf, size_t packet_len);
 //copy rtp stream buffer to dma region
 int snoip_rtp_stream_copy_dma(struct snoip_rtp_stream *stream,
 				     struct snd_pcm_runtime *runtime, uint32_t bytes);
