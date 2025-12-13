@@ -30,6 +30,11 @@ int snoip_rtp_stream_create(struct snoip_rtp_stream **stream, size_t size)
 	strm->empty = true;
     strm->size = size;
 
+    atomic_long_set(&strm->net_reader, 0);
+    atomic_long_set(&strm->net_writer, 0);
+    atomic_long_set(&strm->hw_reader, 0);
+    atomic_long_set(&strm->hw_writer, 0);
+
 	*stream = strm;
 	return 0;
 }
@@ -79,7 +84,7 @@ int snoip_rtp_stream_write(struct snoip_rtp_stream *stream,
 	int start_idx = header->sequence_number % stream->size;
 	if (stream->empty) {
 		stream->empty = false;
-		stream->reader = start_idx;
+		atomic_long_set(&stream->net_reader, start_idx);
 	}
 
 	stream->packet_info[start_idx] = header->vpxcc;
@@ -103,40 +108,39 @@ int snoip_rtp_stream_write(struct snoip_rtp_stream *stream,
         }
         memcpy(stream->data + (start_idx * RTP_PAYLOAD_SIZE), packet_buf + offset, payload_len);
     }
-
 	return 0;
 }
 
-int snoip_rtp_stream_copy_dma(struct snoip_rtp_stream *stream,
-			      struct snd_pcm_runtime *runtime, uint32_t bytes)
-{
-	char *dst = runtime->dma_area;
-	char *src = stream->data;
-
-	unsigned int stream_bytes = stream->size * RTP_PAYLOAD_SIZE;
-	uint32_t b = bytes;
-
-	unsigned int src_offset = stream->reader * RTP_PAYLOAD_SIZE;
-	unsigned int dst_offset = stream->writer;
-
-	for (;;) {
-		uint32_t size = bytes;
-		if (size + dst_offset > runtime->dma_bytes)
-			size = runtime->dma_bytes - dst_offset;
-		if (size + src_offset > stream->size * RTP_PAYLOAD_SIZE)
-			size = runtime->dma_bytes - src_offset;
-		else
-			memcpy(dst + dst_offset, src + src_offset, size);
-
-		bytes -= size;
-		if (bytes == 0)
-			break;
-		src_offset = (src_offset + size) % stream_bytes;
-		dst_offset = (dst_offset + size) % runtime->dma_bytes;
-	}
-
-	stream->reader = (src_offset + b) % stream_bytes;
-	stream->writer = (dst_offset + b) % runtime->dma_bytes;
-
-	return 0;
-}
+// int snoip_rtp_stream_copy_dma(struct snoip_rtp_stream *stream,
+// 			      struct snd_pcm_runtime *runtime, uint32_t bytes)
+// {
+// 	char *dst = runtime->dma_area;
+// 	char *src = stream->data;
+//
+// 	unsigned int stream_bytes = stream->size * RTP_PAYLOAD_SIZE;
+// 	uint32_t b = bytes;
+//
+// 	unsigned int src_offset = stream->reader * RTP_PAYLOAD_SIZE;
+// 	unsigned int dst_offset = stream->writer;
+//
+// 	for (;;) {
+// 		uint32_t size = bytes;
+// 		if (size + dst_offset > runtime->dma_bytes)
+// 			size = runtime->dma_bytes - dst_offset;
+// 		if (size + src_offset > stream->size * RTP_PAYLOAD_SIZE)
+// 			size = runtime->dma_bytes - src_offset;
+// 		else
+// 			memcpy(dst + dst_offset, src + src_offset, size);
+//
+// 		bytes -= size;
+// 		if (bytes == 0)
+// 			break;
+// 		src_offset = (src_offset + size) % stream_bytes;
+// 		dst_offset = (dst_offset + size) % runtime->dma_bytes;
+// 	}
+//
+// 	stream->reader = (src_offset + b) % stream_bytes;
+// 	stream->writer = (dst_offset + b) % runtime->dma_bytes;
+//
+// 	return 0;
+// }

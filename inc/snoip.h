@@ -25,8 +25,10 @@ struct snoip_rtp_stream {
 	bool empty;
 	uint32_t sync_source;
 	uint32_t size;
-	uint32_t reader;
-	uint32_t writer;
+	atomic_long_t net_reader;
+	atomic_long_t net_writer;
+    atomic_long_t hw_reader;
+    atomic_long_t hw_writer;
 	uint32_t *packet_info;
 	uint32_t *timestamp;
 	uint32_t *csrc;
