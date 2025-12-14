@@ -1,0 +1,667 @@
+// SPDX-License-Identifier: GPL-1.0-or-later
+/*
+ *  AES67 soundcard
+ *
+ *  */
+
+#include <snoip.h>
+
+static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
+static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
+static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
+static int pcm_devs[SNDRV_CARDS] = { [0 ...(SNDRV_CARDS - 1)] = 1 };
+static int pcm_substreams[SNDRV_CARDS] = { [0 ...(SNDRV_CARDS - 1)] = 8 };
+
+/* work for the network streams */
+static struct workqueue_struct *io_workqueue;
+
+static struct platform_device *devices[SNDRV_CARDS];
+
+#define CARD_NAME "AES67 Virtual Soundcard"
+
+#define AES67_NET_SUCCESS 0
+
+#define AES67_BUFFER_BYTES (32 * 1024)
+
+#define AES67_STREAM_RX 0
+#define AES67_STREAM_TX 1
+module_param_array(index, int, NULL, 0444);
+MODULE_PARM_DESC(index, "Index value for " CARD_NAME " soundcard.");
+module_param_array(id, charp, NULL, 0444);
+MODULE_PARM_DESC(id, "ID string for " CARD_NAME " soundcard.");
+module_param_array(enable, bool, NULL, 0444);
+MODULE_PARM_DESC(enable, "Enable " CARD_NAME " soundcard.");
+module_param_array(pcm_devs, int, NULL, 0444);
+MODULE_PARM_DESC(pcm_devs, "PCM devices # (0-4) for dummy driver.");
+module_param_array(pcm_substreams, int, NULL, 0444);
+MODULE_PARM_DESC(pcm_substreams, "PCM substreams # (1-128) for dummy driver.");
+
+MODULE_AUTHOR("Preston Baxter <preston@preston-baxter.com>");
+MODULE_DESCRIPTION("AES67 Virtual Soundcard");
+MODULE_LICENSE("GPL");
+
+///
+/// Virtual Hardware
+///
+static int snd_aes67_new_pcm(struct snd_aes67_vhw *virtcard);
+static int snd_aes67_pcm_playback_open(struct snd_pcm_substream *substream);
+static int snd_aes67_pcm_playback_close(struct snd_pcm_substream *substream);
+static int snd_aes67_pcm_capture_open(struct snd_pcm_substream *substream);
+static int snd_aes67_pcm_capture_close(struct snd_pcm_substream *substream);
+static int snd_aes67_pcm_hw_params(struct snd_pcm_substream *substream,
+				   struct snd_pcm_hw_params *hw_params);
+static int snd_aes67_pcm_hw_free(struct snd_pcm_substream *substream);
+static int snd_aes67_pcm_prepare(struct snd_pcm_substream *substream);
+static int snd_aes67_pcm_trigger(struct snd_pcm_substream *substream, int cmd);
+static snd_pcm_uframes_t
+snd_aes67_pcm_playback_pointer(struct snd_pcm_substream *substream);
+static snd_pcm_uframes_t
+snd_aes67_pcm_capture_pointer(struct snd_pcm_substream *substream);
+static int snd_aes67_free(struct snd_aes67_vhw *virtcard);
+static int snd_aes67_dev_free(struct snd_device *device);
+
+static void aes67_rtp_stream_free(struct aes67_rtp_stream *stream);
+static int aes67_rtp_stream_create(struct aes67_rtp_stream **stream);
+static void aes67_rtp_data_ready(struct sock *sk);
+static void aes67_rtp_rx(struct work_struct *work);
+static int aes67_rtp_rx_write_dma(struct aes67_rtp_stream *stream,
+				  uint8_t *packet, ssize_t packet_len);
+
+/* Playback definition */
+static struct snd_pcm_hardware snd_aes67_pcm_playback_hw = {
+	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+		 SNDRV_PCM_INFO_BLOCK_TRANSFER | SNDRV_PCM_INFO_MMAP_VALID),
+	.formats = SNDRV_PCM_FMTBIT_S16_LE,
+	.rates = SNDRV_PCM_RATE_8000_48000,
+	.rate_min = 8000,
+	.rate_max = 48000,
+	.channels_min = 2,
+	.channels_max = 2,
+	.buffer_bytes_max = 32768,
+	.period_bytes_min = 4096,
+	.period_bytes_max = 32768,
+	.periods_min = 1,
+	.periods_max = 1024,
+};
+
+/* Capture definition */
+static struct snd_pcm_hardware snd_aes67_pcm_capture_hw = {
+	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+		 SNDRV_PCM_INFO_BLOCK_TRANSFER | SNDRV_PCM_INFO_MMAP_VALID),
+	.formats = SNDRV_PCM_FMTBIT_S16_LE,
+	.rates = SNDRV_PCM_RATE_8000_48000,
+	.rate_min = 8000,
+	.rate_max = 48000,
+	.channels_min = 1,
+	.channels_max = 2,
+	.buffer_bytes_max = 32768,
+	.period_bytes_min = 96,
+	.period_bytes_max = 8192,
+	.periods_min = 2,
+	.periods_max = 1024,
+};
+
+/* operators */
+static struct snd_pcm_ops snd_aes67_playback_ops = {
+	.open = snd_aes67_pcm_playback_open,
+	.close = snd_aes67_pcm_playback_close,
+	.hw_params = snd_aes67_pcm_hw_params,
+	.hw_free = snd_aes67_pcm_hw_free,
+	.prepare = snd_aes67_pcm_prepare,
+	.trigger = snd_aes67_pcm_trigger,
+	.pointer = snd_aes67_pcm_playback_pointer,
+};
+
+/* operators */
+static struct snd_pcm_ops snd_aes67_capture_ops = {
+	.open = snd_aes67_pcm_capture_open,
+	.close = snd_aes67_pcm_capture_close,
+	.hw_params = snd_aes67_pcm_hw_params,
+	.hw_free = snd_aes67_pcm_hw_free,
+	.prepare = snd_aes67_pcm_prepare,
+	.trigger = snd_aes67_pcm_trigger,
+	.pointer = snd_aes67_pcm_capture_pointer,
+};
+
+/* Constructor */
+static int snd_aes67_create(struct snd_card *card,
+			    struct snd_aes67_vhw **rvirtcard)
+{
+	struct snd_aes67_vhw *virtcard;
+	int err;
+	static const struct snd_device_ops ops = {
+		.dev_free = snd_aes67_dev_free,
+	};
+
+	*rvirtcard = NULL;
+	/* allocate memory for virt card */
+	virtcard = kzalloc(sizeof(*virtcard), GFP_KERNEL);
+	if (virtcard == NULL)
+		return -ENOMEM;
+
+	virtcard->card = card;
+
+	/* Build Sound Device */
+	err = snd_device_new(card, SNDRV_DEV_LOWLEVEL, virtcard, &ops);
+	if (err < 0) {
+		printk(KERN_ERR "Failed to create AES67 device\n");
+		goto init_fail;
+	}
+
+	/* Create Streams */
+	err = aes67_rtp_stream_create(&virtcard->rx);
+	if (err < 0) {
+		printk(KERN_ERR "Failed to create AES67 RX stream\n");
+		goto init_fail;
+	}
+	err = aes67_rtp_stream_create(&virtcard->tx);
+	if (err < 0) {
+		printk(KERN_ERR "Failed to create AES67 TX stream\n");
+		goto init_fail;
+	}
+
+	/* Add PCM */
+	err = snd_aes67_new_pcm(virtcard);
+	if (err < 0) {
+		printk(KERN_ERR "Failed to create PCM for AES67 device\n");
+		goto init_fail;
+	}
+	goto success;
+
+init_fail:
+	snd_aes67_free(virtcard);
+	return err;
+
+success:
+	printk(KERN_INFO "Successfully created AES67\n");
+	*rvirtcard = virtcard;
+	return 0;
+}
+
+/* Destructor */
+static int snd_aes67_dev_free(struct snd_device *device)
+{
+	return snd_aes67_free(device->device_data);
+}
+
+static int snd_aes67_free(struct snd_aes67_vhw *virtcard)
+{
+	/* free card */
+	printk(KERN_INFO "Freeing Soundcard\n");
+	snd_card_free(virtcard->card);
+
+	/* free streams */
+	if (virtcard->rx) {
+		printk(KERN_INFO "Freeing RX stream\n");
+		aes67_rtp_stream_free(virtcard->rx);
+	}
+
+	if (virtcard->tx) {
+		printk(KERN_INFO "Freeing TX stream\n");
+		aes67_rtp_stream_free(virtcard->tx);
+	}
+
+	kfree(virtcard);
+	return 0;
+}
+
+static int snd_aes67_new_pcm(struct snd_aes67_vhw *virtcard)
+{
+	struct snd_pcm *pcm;
+	int err;
+
+	printk(KERN_INFO "Initializing PCM for Virtual Soundcard");
+	err = snd_pcm_new(virtcard->card, CARD_NAME, 0, 1, 1, &pcm);
+	if (err < 0) {
+		printk(KERN_INFO
+		       "Failed initializing PCM for Virtual Soundcard");
+		return err;
+	}
+
+	printk(KERN_INFO "Assigning PCM to Virtual Soundcard");
+	pcm->private_data = virtcard;
+	strcpy(pcm->name, CARD_NAME);
+	virtcard->pcm = pcm;
+	/* set operators */
+	printk(KERN_INFO "Setting PCM Playback ops");
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK,
+			&snd_aes67_playback_ops);
+	printk(KERN_INFO "Setting PCM Capture ops");
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &snd_aes67_capture_ops);
+	/*Da buffers*/
+	printk(KERN_INFO "Setting PCM managed buffer");
+	snd_pcm_lib_preallocate_pages_for_all(pcm, SNDRV_DMA_TYPE_CONTINUOUS,
+					      NULL, AES67_BUFFER_BYTES,
+					      AES67_BUFFER_BYTES);
+
+	return 0;
+}
+
+static int snd_aes67_pcm_playback_open(struct snd_pcm_substream *substream)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct snd_aes67_vhw *chip = snd_pcm_substream_chip(substream);
+
+	/* Start transmit loop */
+	spin_lock(&chip->tx->lock);
+	if (chip->tx && !chip->tx->running) {
+		printk(KERN_INFO "Starting TX work queue\n");
+		chip->tx->running = true;
+		queue_work(io_workqueue, &chip->tx->work);
+	}
+	spin_unlock(&chip->tx->lock);
+
+	runtime->hw = snd_aes67_pcm_playback_hw;
+	return 0;
+}
+
+static int snd_aes67_pcm_playback_close(struct snd_pcm_substream *substream)
+{
+	struct snd_aes67_vhw *chip = snd_pcm_substream_chip(substream);
+
+	spin_lock(&chip->tx->lock);
+	chip->tx->running = false;
+	spin_unlock(&chip->tx->lock);
+	return 0;
+}
+
+static int snd_aes67_pcm_capture_open(struct snd_pcm_substream *substream)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct snd_aes67_vhw *chip = snd_pcm_substream_chip(substream);
+
+	/* Start receive loop */
+	spin_lock(&chip->rx->lock);
+	if (chip->rx && !chip->rx->running) {
+		printk(KERN_INFO "Starting RX work queue\n");
+		chip->rx->running = true;
+		chip->rx->pcm_substream = substream;
+
+		INIT_WORK(&chip->rx->work, aes67_rtp_rx);
+
+		struct sock *sk = chip->rx->socket->sk;
+		chip->rx->original_data_ready = sk->sk_data_ready;
+		sk->sk_user_data = chip->rx;
+		sk->sk_data_ready = aes67_rtp_data_ready;
+	}
+	spin_unlock(&chip->rx->lock);
+
+	runtime->hw = snd_aes67_pcm_capture_hw;
+	return 0;
+}
+
+static int snd_aes67_pcm_capture_close(struct snd_pcm_substream *substream)
+{
+	struct snd_aes67_vhw *chip = snd_pcm_substream_chip(substream);
+
+	spin_lock(&chip->rx->lock);
+	chip->tx->running = false;
+	cancel_work(&chip->rx->work);
+	spin_unlock(&chip->rx->lock);
+	return 0;
+}
+
+static int snd_aes67_pcm_hw_params(struct snd_pcm_substream *substream,
+				   struct snd_pcm_hw_params *hw_params)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	int ret;
+
+	// Step 1: Validate parameters and set up the buffer pointer.
+	// This function checks the requested size against the constraints
+	// and prepares the runtime->dma_area to use the preallocated pages.
+	ret = snd_pcm_lib_malloc_pages(substream,
+				       params_buffer_bytes(hw_params));
+	if (ret < 0) {
+		printk(KERN_ERR
+		       "AES67: Failed to allocate/map PCM pages in hw_params: %d\n",
+		       ret);
+		return ret;
+	}
+
+	// Step 2 (Optional but Recommended): Store negotiated parameters.
+	// You should save the final period size for your network worker loop.
+	// This is crucial for timing your AES67 packets.
+	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+		// struct snd_aes67_vhw *chip = snd_pcm_substream_chip(substream);
+		//
+		// chip->rx->period_size = params_period_size(hw_params);
+		// chip->rx->rate = params_rate(hw_params);
+		//
+		// printk(KERN_INFO "AES67 Capture: Negotiated Rate=%u, Period Size=%lu samples\n",
+		//        chip->rx->rate, chip->rx->period_size);
+	}
+	// ... add logic for playback stream if needed ...
+
+	return 0;
+}
+
+/* hw_free callback */
+static int snd_aes67_pcm_hw_free(struct snd_pcm_substream *substream)
+{
+	return snd_pcm_lib_free_pages(substream);
+	return 0;
+}
+
+static int snd_aes67_pcm_prepare(struct snd_pcm_substream *substream)
+{
+	/* set up the hardware with the current configuration
+         * for example...
+         */
+	return 0;
+}
+
+static int snd_aes67_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+{
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+		break;
+	case SNDRV_PCM_TRIGGER_STOP:
+		/* do something to stop the PCM engine */
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return -EINVAL;
+}
+
+static snd_pcm_uframes_t
+snd_aes67_pcm_capture_pointer(struct snd_pcm_substream *substream)
+{
+	struct snd_aes67_vhw *chip = snd_pcm_substream_chip(substream);
+	return bytes_to_frames(substream->runtime, atomic_read(chip->rx->head));
+}
+
+static snd_pcm_uframes_t
+snd_aes67_pcm_playback_pointer(struct snd_pcm_substream *substream)
+{
+	// struct snd_aes67_vhw *chip = snd_pcm_substream_chip(substream);
+	// unsigned int current_frame;
+
+	/* get the current hardware pointer */
+	return 0;
+}
+
+///
+/// Platform
+///
+
+static int snd_aes67_probe(struct platform_device *devptr);
+static void snd_aes67_remove(struct platform_device *pdev);
+static int snd_aes67_suspend(struct device *pdev);
+static int snd_aes67_resume(struct device *pdev);
+/* Power management operations. Most definitely need to revisit this */
+static DEFINE_SIMPLE_DEV_PM_OPS(snd_aes67_pm, snd_aes67_suspend,
+				snd_aes67_resume);
+
+#define SND_AES67_DRIVER "snd_aes67"
+
+static struct platform_driver snd_aes67_driver = {
+	.probe = snd_aes67_probe,
+	.driver = {
+		.name = SND_AES67_DRIVER,
+		.pm = &snd_aes67_pm,
+	},
+    .remove = snd_aes67_remove,
+};
+
+static int snd_aes67_probe(struct platform_device *devptr)
+{
+	struct snd_card *card;
+	struct snd_aes67_vhw *virtcard;
+	int dev = devptr->id;
+	int err;
+
+	printk(KERN_INFO "Attempting to create Soundcard for AES67\n");
+	err = snd_devm_card_new(&devptr->dev, index[dev], id[dev], THIS_MODULE,
+				sizeof(struct snd_aes67_vhw), &card);
+	if (err < 0) {
+		printk(KERN_ERR "Unable to create AES67 Soundcard\n");
+		return err;
+	}
+	virtcard = card->private_data;
+	virtcard->dev = &devptr->dev; //I don't know if this is safe
+
+	printk(KERN_INFO "Attempting to create AES67 Virtual Soundcard\n");
+	err = snd_aes67_create(card, &virtcard);
+	if (err < 0) {
+		printk(KERN_ERR "Unable to create AES67rtual Soundcard\n");
+		goto error;
+	}
+
+	/* Setup Names */
+	strcpy(card->driver, "AES67 VSC");
+	strcpy(card->shortname, "AES67 Virtual Soundcard");
+	strcpy(card->longname, "AES67 Virtual Soundcard - 8x8");
+
+	printk(KERN_INFO "Attempting to Register AES67 Virtual Soundcard\n");
+	err = snd_card_register(card);
+	if (err < 0) {
+		printk(KERN_ERR "Unable to Register AES67 Virtual Soundcard\n");
+		goto error;
+	}
+	platform_set_drvdata(devptr, card);
+	return 0;
+
+error:
+	snd_card_free(card);
+	return err;
+}
+
+/* Power Methods */
+static int snd_aes67_suspend(struct device *pdev)
+{
+	struct snd_card *card = dev_get_drvdata(pdev);
+
+	snd_power_change_state(card, SNDRV_CTL_POWER_D3hot);
+	return 0;
+}
+
+static int snd_aes67_resume(struct device *pdev)
+{
+	struct snd_card *card = dev_get_drvdata(pdev);
+
+	snd_power_change_state(card, SNDRV_CTL_POWER_D0);
+	return 0;
+}
+
+// This is the function linked to .remove in your platform_driver structure
+static void snd_aes67_remove(struct platform_device *pdev)
+{
+	struct snd_aes67_vhw *virtcard = platform_get_drvdata(pdev);
+
+	if (virtcard) {
+		snd_aes67_free(virtcard);
+	}
+}
+
+/* Work queue Management */
+static void aes67_rtp_work_stop(void)
+{
+	if (io_workqueue) {
+		destroy_workqueue(io_workqueue);
+		io_workqueue = NULL;
+	}
+}
+
+static int aes67_rtp_work_start(void)
+{
+	io_workqueue = alloc_workqueue(
+		"aes67_io", WQ_HIGHPRI | WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
+
+	if (!io_workqueue) {
+		printk(KERN_ERR "Failed to start io workqueue struct\n");
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+/* Network functions */
+static void aes67_rtp_tx_net(struct work_struct *work)
+{
+	printk(KERN_WARNING "Faking TX things\n");
+	return;
+}
+
+static void aes67_rtp_data_ready(struct sock *sk)
+{
+	struct aes67_rtp_stream *stream = sk->sk_user_data;
+
+	sk->sk_data_ready = stream->original_data_ready;
+
+	schedule_work(&stream->work);
+
+	if (stream->original_data_ready) {
+		stream->original_data_ready(sk);
+	}
+}
+
+static void aes67_rtp_rx(struct work_struct *work)
+{
+	struct aes67_rtp_stream *stream =
+		container_of(work, struct aes67_rtp_stream, work);
+	struct msghdr msg = {};
+	msg.msg_flags = MSG_DONTWAIT;
+	int err;
+	size_t recv_buf_size = 2048;
+	ssize_t msglen;
+	uint8_t *recv_buf;
+
+	/* Loop Receive */
+	recv_buf = kzalloc(recv_buf_size, GFP_KERNEL);
+	if (!recv_buf) {
+		printk(KERN_ERR "Failed to allocate network receive buffer\n");
+		goto cleanup;
+	}
+
+	struct kvec iv;
+	iv.iov_base = recv_buf;
+	iv.iov_len = recv_buf_size;
+
+	msglen = kernel_recvmsg(stream->socket, &msg, &iv, 1, iv.iov_len,
+				msg.msg_flags);
+
+	if (msglen < 0) {
+		printk(KERN_ERR "error receiving packet: %zd\n", msglen);
+		goto cleanup;
+	}
+
+	if (msglen > 0) {
+		err = aes67_rtp_rx_write_dma(stream, recv_buf, msglen);
+
+		if (err < 0)
+			printk(KERN_ERR "Failed to write to rtp stream %d\n",
+			       err);
+	}
+
+cleanup:
+	spin_lock(&stream->lock);
+	if (stream->running) {
+		stream->socket->sk->sk_data_ready = aes67_rtp_data_ready;
+	}
+	spin_unlock(&stream->lock);
+	return;
+}
+
+static void aes67_rtp_stream_free(struct aes67_rtp_stream *stream)
+{
+	stream->running = false;
+	if (stream->socket && stream->socket->ops) {
+		stream->socket->ops->release(stream->socket);
+	}
+
+	if (stream->head) {
+		kfree(stream->head);
+	}
+
+	kfree(stream);
+}
+
+static int aes67_rtp_stream_create(struct aes67_rtp_stream **stream)
+{
+	struct aes67_rtp_stream *strm;
+	int err;
+
+	strm = kzalloc(sizeof(*strm), GFP_KERNEL);
+	if (!strm)
+		return -ENOMEM;
+
+	atomic_set(strm->head, 0);
+
+	/* create socket */
+	err = sock_create_kern(&init_net, PF_INET, SOCK_DGRAM, IPPROTO_UDP,
+			       &strm->socket);
+	if (err < 0) {
+		printk(KERN_ERR "Failed to create socket for stream\n");
+		return err;
+	}
+
+	struct sockaddr_in addr = { .sin_family = AF_INET,
+				    .sin_port = htons(9375),
+				    .sin_addr = { htonl(INADDR_ANY) } };
+
+	strm->socket->ops->bind(strm->socket, (struct sockaddr *)&addr,
+				sizeof(addr));
+	if (err < 0) {
+		printk(KERN_ERR
+		       "Failed to bind socket for virtual soundcard\n");
+		return err;
+	}
+
+	*stream = strm;
+	return 0;
+}
+
+///
+/// Module
+///
+
+/* Module init and exit functions */
+static int __init alsa_card_aes67_init(void)
+{
+	int err;
+
+	//Add driver to registry
+	printk(KERN_INFO "Attempting to register driver for AES67\n");
+	err = platform_driver_register(&snd_aes67_driver);
+	if (err < 0) {
+		printk(KERN_ERR "FAILED to register driver for AES67\n");
+		return err;
+	}
+
+	/* Start work queue */
+	err = aes67_rtp_work_start();
+	if (err < 0) {
+		printk(KERN_ERR "FAILED to start workqueue for AES67\n");
+		return err;
+	}
+
+	//register a card in the kernel
+	struct platform_device *device;
+	device = platform_device_register_simple(SND_AES67_DRIVER, 0, NULL, 0);
+	if (IS_ERR(device)) {
+		printk(KERN_ERR "Failed to register AES67 Device\n");
+		return -ENODEV;
+	}
+	if (!platform_get_drvdata(device)) {
+		printk(KERN_ERR "No device data for AES67\n");
+		platform_device_unregister(device);
+		return -ENODEV;
+	}
+	devices[0] = device;
+
+	return 0;
+}
+
+static void __exit alsa_card_aes67_exit(void)
+{
+	printk(KERN_INFO "Attempting to unregister card for AES67\n");
+	platform_device_unregister(devices[0]);
+	printk(KERN_INFO "Attempting to unregistered driver for AES67\n");
+	platform_driver_unregister(&snd_aes67_driver);
+	printk(KERN_INFO "Attempting to stop workqueue for AES67\n");
+	aes67_rtp_work_stop();
+}
+
+module_init(alsa_card_aes67_init) module_exit(alsa_card_aes67_exit)

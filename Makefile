@@ -1,5 +1,5 @@
 obj-m := snoip.o
-snoip-y := aes67.o rtp.o
+snoip-y := snd_aes67.o
 
 ccflags-y := -I $(src)/inc
 
